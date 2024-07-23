@@ -1,228 +1,133 @@
 import asyncio
 import aiohttp
-import json
-import os
+import requests
 import re
+import os
 import time
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning, Comment
-from urllib.parse import urlparse, urljoin
-import warnings
+from urllib.parse import urlparse
 from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_random_exponential
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
-# Ignore XMLParsedAsHTMLWarning
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+def get_user_url():
+    url = input("Please enter a URL for the documentation: ").strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    return url
 
-# Add OpenAI API key
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-async def get_gpt4_response(prompt):
+def is_valid_url(url):
     try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o-mini",  
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts and cleans product information from HTML content."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=4000  # Increased max tokens for longer responses
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error in OpenAI API call: {e}")
-        raise
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
 
-def preprocess_html(html):
-    soup = BeautifulSoup(html, 'lxml')
-
-    # Remove script and style elements
-    for script in soup(["script", "style"]):
-        script.decompose()
-
-    # Remove comments
-    for comment in soup.find_all(string=lambda string: isinstance(string, Comment)):
-        comment.extract()
-
-    # Instead of removing, let's just mark potential non-product areas
-    for elem in soup(['header', 'footer', 'nav']):
-        elem['data-section'] = 'non-product'
-
-    for elem in soup(class_=re.compile(r'menu|sidebar|ad|comment|footer|header|navigation')):
-        elem['data-section'] = 'non-product'
-
-    for elem in soup(id=re.compile(r'menu|sidebar|ad|comment|footer|header|navigation')):
-        elem['data-section'] = 'non-product'
-
-    # Convert to string, maintaining the structure
-    html_string = str(soup)
-
-    # Add a note for GPT about the marked sections
-    html_string = "<!-- Sections marked with data-section='non-product' are likely not part of the main product information -->\n" + html_string
-
-    return html_string
-
-async def process_product_urls(session, product_urls, folder_name):
-    for i, url in enumerate(product_urls):
-        if i > 0 and i % 15 == 0:
-            await asyncio.sleep(60)  # Wait for 60 seconds after every 15 requests
-
-        try:
-            product_name = url.split('/')[-1]
-            file_name = os.path.join(folder_name, f"{product_name}.json")
-            
-            if os.path.exists(file_name):
-                print(f"File {file_name} already exists. Skipping.")
-                continue
-
-            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    
-                    # Preprocess HTML
-                    preprocessed_html = preprocess_html(html)
-                    
-                    # Prepare prompt for GPT-4
-                    prompt = f"""This is the HTML content of an e-commerce product page. Some sections are marked with data-section='non-product' to indicate they might not be part of the main product information. Please extract and present the product information in JSON format, focusing on the unmarked sections but also considering marked sections if they contain relevant product details. Include core product attributes like product name, description, price, and any other available attributes. Preserve the original wording and details as provided by the brand. Make it detailed and comprehensive. Respond with just your polished cleaned JSON version. Here is the HTML content:
-
-{preprocessed_html}"""
-
-                    try:
-                        # Get response from GPT-4
-                        cleaned_text = await get_gpt4_response(prompt)
-                    except Exception as e:
-                        if "context_length_exceeded" in str(e):
-                            print(f"Context length exceeded for {url}. Retrying with reduced content...")
-                            # Remove header and footer content
-                            soup = BeautifulSoup(html, 'lxml')
-                            for elem in soup(['header', 'footer', 'nav']):
-                                elem.decompose()
-                            reduced_html = str(soup)
-                            reduced_prompt = f"""This is the reduced HTML content of an e-commerce product page with header and footer removed. Please extract and present the product information in JSON format. Include core product attributes like product name, description, price, and any other available attributes. Preserve the original wording and details as provided by the brand. Make it detailed and comprehensive. Respond with just your polished cleaned JSON version. Here is the reduced HTML content:
-
-{reduced_html}"""
-                            cleaned_text = await get_gpt4_response(reduced_prompt)
-                        else:
-                            raise e
-
-                    # Clean up the JSON response
-                    cleaned_json = cleaned_text.strip()
-                    if cleaned_json.startswith('```json'):
-                        cleaned_json = cleaned_json[7:]
-                    if cleaned_json.endswith('```'):
-                        cleaned_json = cleaned_json[:-3]
-                    
-                    # Parse and re-serialize the JSON to ensure proper formatting
-                    try:
-                        json_data = json.loads(cleaned_json)
-                        json_data['url'] = url  # Add the URL to the JSON data
-                        
-                        with open(file_name, 'w', encoding='utf-8') as f:
-                            json.dump(json_data, f, ensure_ascii=False, indent=2)
-                        print(f"Saved cleaned content for {file_name}")
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON for {url}: {e}")
-                        # Optionally, save the raw text if JSON parsing fails
-                        with open(f"{file_name}.txt", 'w', encoding='utf-8') as f:
-                            f.write(f"URL: {url}\n\n")
-                            f.write(cleaned_text)
-                        print(f"Saved raw text for {file_name}.txt due to JSON parsing error")
-                else:
-                    print(f"Failed to retrieve data for {url}. Status code: {response.status}")
-        except Exception as e:
-            print(f"An error occurred for {url}: {e}")
-
-
-async def get_internal_links(session, base_url, url, visited_urls, file, max_retries=3):
-    if url in visited_urls:
-        return
-
-    visited_urls.add(url)
-    print(f"Crawling: {url}")
-    file.write(url + '\n')
-    file.flush()
-
+async def scrape_url_async(session, url, max_retries=3):
+    jina_api_url = f"https://r.jina.ai/{url}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('JINA_API_KEY')}",
+        "X-Timeout": "10"
+    }
+    
     for attempt in range(max_retries):
         try:
-            async with session.get(url, timeout=30) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'lxml')  # Using lxml parser
-                    sub_links = [urljoin(base_url, a['href']) for a in soup.find_all('a', href=True)]
-                    tasks = []
-                    for link in sub_links:
-                        parsed_link = urlparse(link)
-                        if parsed_link.netloc == urlparse(base_url).netloc and link not in visited_urls:
-                            task = asyncio.ensure_future(get_internal_links(session, base_url, link, visited_urls, file))
-                            tasks.append(task)
-                    await asyncio.gather(*tasks)
-                else:
-                    print(f"Failed to retrieve data from {url}. Status code: {response.status}")
-                break
-        except asyncio.TimeoutError:
-            if attempt < max_retries - 1:
-                print(f"Timeout occurred for {url}. Retrying... (Attempt {attempt + 1}/{max_retries})")
-                await asyncio.sleep(1)
-            else:
-                print(f"Max retries reached for {url}. Moving on...")
-        except Exception as e:
-            print(f"An error occurred for {url}: {e}")
-            break
+            async with session.get(jina_api_url, headers=headers) as response:
+                response.raise_for_status()
+                return await response.text()
+        except aiohttp.ClientError as e:
+            if attempt == max_retries - 1:
+                print(f"Error scraping URL after {max_retries} attempts: {e}")
+                return None
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-async def main():
-    homepage_url = input("Enter the homepage URL you'd like to crawl: ")
-
-    if not homepage_url.startswith(('http://', 'https://')):
-        homepage_url = 'http://' + homepage_url
-
-    print(f"Starting to crawl from: {homepage_url}")
-
-    folder_name = urlparse(homepage_url).netloc
-    os.makedirs(folder_name, exist_ok=True)
-    file_name = os.path.join(folder_name, "full_sitemap.txt")
-    visited_urls = set()
-
+async def scrape_urls_concurrently(urls):
     async with aiohttp.ClientSession() as session:
-        with open(file_name, 'w', encoding='utf-8') as file:
-            await get_internal_links(session, homepage_url, homepage_url, visited_urls, file)
+        tasks = [scrape_url_async(session, url) for url in urls]
+        return await asyncio.gather(*tasks)
 
-    print(f"Crawling completed. Sorting URLs...")
-    
-    # Read the file, normalize and deduplicate URLs, then sort them
-    with open(file_name, 'r', encoding='utf-8') as file:
-        urls = file.readlines()
-    
-    # Normalize and deduplicate URLs
-    normalized_urls = set()
+def extract_urls(content):
+    url_pattern = r'https?://[^\s)\]"]+'
+    urls = re.findall(url_pattern, content)
+    unique_urls = []
+    seen = set()
     for url in urls:
-        # Remove whitespace, convert to lowercase, and remove trailing slashes
-        normalized_url = url.strip().lower().rstrip('/')
-        # Remove query parameters
-        normalized_url = normalized_url.split('?')[0]
-        normalized_urls.add(normalized_url)
-    
-    sorted_urls = sorted(normalized_urls)
-    
-    with open(file_name, 'w', encoding='utf-8') as file:
-        for url in sorted_urls:
-            file.write(url + '\n')
+        if url not in seen and is_valid_url(url):
+            seen.add(url)
+            unique_urls.append(url)
+    return unique_urls
 
-    print(f"All internal links have been saved and sorted in {file_name}")
-    print(f"Total unique URLs found: {len(sorted_urls)}")
+def get_filename_from_url(url):
+    parsed_url = urlparse(url)
+    domain_parts = parsed_url.netloc.split('.')
+    if len(domain_parts) > 2 and domain_parts[0] != 'www':
+        domain = f"{domain_parts[0]}_{domain_parts[1]}"
+    elif domain_parts[0] == 'www':
+        domain = domain_parts[1]
+    else:
+        domain = domain_parts[0]
+    return f"{domain}_docs.txt"
 
-    # Process product URLs
-    product_urls = [url for url in sorted_urls if '/products/' in url]
-    print(f"Found {len(product_urls)} unique product URLs. Processing with Jina AI...")
+def create_content_section(content, url, index):
+    separator = "=" * 80
+    return f"\n{separator}\nSection {index}: Content from {url}\n{separator}\n\n{content}\n\n"
+
+def write_content_to_file(filename, sections):
+    with open(filename, 'w', encoding='utf-8') as file:
+        file.write("".join(sections))
+
+def filter_urls(urls, base_url):
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+    urls_text = "\n".join(urls)
+    base_domain = urlparse(base_url).netloc
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a URL curator tasked with filtering out obviously unrelated content from a list of URLs for a software tool or API."},
+            {"role": "user", "content": f"""We need to extract documentation for a tool with the base domain {base_domain}. Here's a list of URLs we've found:
+
+{urls_text}
+
+Please filter this list based on the following criteria:
+1. Keep URLs that appear to be related to documentation, guides, tutorials, or API references.
+2. Include relevant subdomains like 'docs.{base_domain}', 'api.{base_domain}', or 'developer.{base_domain}'.
+3. Remove URLs for obviously unrelated content such as community forums, status pages, blog posts, or contact pages.
+
+Respond with a list of filtered URLs, one per line, without any additional text or formatting. Ensure all URLs are valid."""}
+        ]
+    )
+    filtered_urls = [url.strip() for url in response.choices[0].message.content.strip().split('\n') if is_valid_url(url.strip())]
+    return filtered_urls
+
+async def main_async():
+    user_url = get_user_url()
+    print(f"You entered: {user_url}")
 
     async with aiohttp.ClientSession() as session:
-        await process_product_urls(session, product_urls, folder_name)
-
-    print("Finished processing product URLs with Jina AI.")
+        initial_content = await scrape_url_async(session, user_url)
+        if initial_content:
+            urls = extract_urls(initial_content)
+            print(f"Found {len(urls)} unique URLs.")
+            
+            filtered_urls = filter_urls(urls, user_url)
+            print(f"Filtered down to {len(filtered_urls)} relevant URLs.")
+            
+            filename = get_filename_from_url(user_url)
+            contents = await scrape_urls_concurrently(filtered_urls)
+            
+            sections = []
+            for i, (url, content) in enumerate(zip(filtered_urls, contents), 1):
+                if content:
+                    sections.append(create_content_section(content, url, i))
+                    print(f"URL #{i} Scraped ✅ - {url}")
+                else:
+                    print(f"URL #{i} Found an Error and Skipped ❌ - {url}")
+            
+            write_content_to_file(filename, sections)
+            print(f"📃 Content saved to {filename}. 📃")
+        else:
+            print("❌ Failed to scrape the initial URL. ❌")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_async())
