@@ -1,4 +1,4 @@
-# 📚 GPT Doc Crawler 🕷️
+# 📚 API Doc Scraper 🕷️
 
 ## Description
 
