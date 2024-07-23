@@ -2,7 +2,7 @@
 
 ## Description
 
-API Doc Scraper is a powerful document scraper that helps you gather API documentation effortlessly! 🚀 Provide it with the URL of an API's documentation, and it will crawl through the pages, creating a comprehensive text file ready for use with your favorite LLM (Language Model). 🤖
+API Doc Scraper is a powerful document scraper that helps you gather API documentation effortlessly! 🚀 Provide it with the URL of an API's documentation, and it will crawl through the pages, creating a comprehensive text file ready for use with your favorite LLM. 🤖
 
 ## Features
 
